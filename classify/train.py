@@ -95,15 +95,32 @@ def train(opt, device):
                                                    rank=LOCAL_RANK,
                                                    workers=nw)
 
-    test_dir = data_dir / 'test' if (data_dir / 'test').exists() else data_dir / 'val'  # data/test or data/val
+    test_dir = data_dir / 'test'
+    val_dir = data_dir / 'val'  
     if RANK in {-1, 0}:
-        testloader = create_classification_dataloader(path=test_dir,
-                                                      imgsz=imgsz,
-                                                      batch_size=bs // WORLD_SIZE * 2,
-                                                      augment=False,
-                                                      cache=opt.cache,
-                                                      rank=-1,
-                                                      workers=nw)
+        if (data_dir / 'test').exists():
+            testloader = create_classification_dataloader(path=test_dir,
+                                                          imgsz=imgsz,
+                                                          batch_size=bs // WORLD_SIZE * 2,
+                                                          augment=False,
+                                                          cache=opt.cache,
+                                                          rank=-1,
+                                                          workers=nw)
+            valloader = create_classification_dataloader(path=val_dir,
+                                                          imgsz=imgsz,
+                                                          batch_size=bs // WORLD_SIZE * 2,
+                                                          augment=False,
+                                                          cache=opt.cache,
+                                                          rank=-1,
+                                                          workers=nw)
+        else:
+            testloader = create_classification_dataloader(path=val_dir,
+                                                          imgsz=imgsz,
+                                                          batch_size=bs // WORLD_SIZE * 2,
+                                                          augment=False,
+                                                          cache=opt.cache,
+                                                          rank=-1,
+                                                          workers=nw)
 
     # Model
     with torch_distributed_zero_first(LOCAL_RANK), WorkingDirectory(ROOT):
@@ -169,7 +186,7 @@ def train(opt, device):
                 f'Starting {opt.model} training on {data} dataset with {nc} classes for {epochs} epochs...\n\n'
                 f"{'Epoch':>10}{'GPU_mem':>10}{'train_loss':>12}{f'{val}_loss':>12}{'top1_acc':>12}{'top5_acc':>12}")
     for epoch in range(epochs):  # loop over the dataset multiple times
-        tloss, vloss, fitness = 0.0, 0.0, 0.0  # train loss, val loss, fitness
+        tloss, vloss, testloss, fitness = 0.0, 0.0, 0.0, 0.0  # train loss, val loss, fitness
         model.train()
         if RANK != -1:
             trainloader.sampler.set_epoch(epoch)
@@ -203,11 +220,15 @@ def train(opt, device):
 
                 # Test
                 if i == len(pbar) - 1:  # last batch
-                    top1, top5, vloss = validate.run(model=ema.ema,
+                    vtop1, vtop5, vloss = validate.run(model=ema.ema,
+                                                     dataloader=valloader,
+                                                     criterion=criterion,
+                                                     pbar=pbar)  # test accuracy, loss
+                    ttop1, ttop5, testloss = validate.run(model=ema.ema,
                                                      dataloader=testloader,
                                                      criterion=criterion,
                                                      pbar=pbar)  # test accuracy, loss
-                    fitness = top1  # define fitness as top1 accuracy
+                    fitness = vtop1  # define fitness as top1 accuracy
 
         # Scheduler
         scheduler.step()
@@ -221,9 +242,12 @@ def train(opt, device):
             # Log
             metrics = {
                 'train/loss': tloss,
-                f'{val}/loss': vloss,
-                'metrics/accuracy_top1': top1,
-                'metrics/accuracy_top5': top5,
+                'val/loss': vloss,
+                'test/loss': testloss,
+                'metrics/val/accuracy_top1': vtop1,
+                'metrics/val/accuracy_top5': vtop5,
+                'metrics/test/accuracy_top1': ttop1,
+                'metrics/test/accuracy_top5': ttop5,
                 'lr/0': optimizer.param_groups[0]['lr']}  # learning rate
             logger.log_metrics(metrics, epoch)
 
